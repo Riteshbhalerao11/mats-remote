@@ -1,1 +1,1 @@
-{"splits": ["train", "eval"]}
+{"splits": ["deploy", "eval"]}

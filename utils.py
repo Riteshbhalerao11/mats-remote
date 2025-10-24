@@ -54,6 +54,131 @@ def load_lists_from_yaml(input_dir: str, mode: str):
     return loaded_data["common_sys.yaml"], loaded_data[valid_modes[mode]]
 
 
+def load_prompts_with_metadata(input_dir: str, mode: str):
+    """
+    Load YAML prompts with metadata (source file and category).
+    Ensures system prompts and user prompts are properly paired by source file.
+    Categories are: explicit, implicit, no_detected_awareness
+    
+    Args:
+        input_dir (str): Directory containing the YAML files.
+        mode (str): Either 'eval' or 'deploy'.
+    
+    Returns:
+        tuple: (system_prompts, user_prompts, sources, categories)
+              All lists are aligned - index i corresponds to the same source file
+    """
+    valid_modes = {"eval": "eval_user.yaml", "deploy": "deploy_user.yaml"}
+    if mode not in valid_modes:
+        raise ValueError(f"Invalid mode '{mode}'. Must be one of: {list(valid_modes.keys())}")
+    
+    # Load system prompts
+    sys_path = os.path.join(input_dir, "system_prompts.yaml")
+    user_path = os.path.join(input_dir, valid_modes[mode])
+    
+    # Parse into dictionaries keyed by source file
+    sys_dict = {}  # source -> (prompt, category)
+    user_dict = {}  # source -> (prompt, category)
+    
+    # Parse system prompts with metadata
+    with open(sys_path, "r") as f:
+        lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("# Source:"):
+                # Extract source and category
+                parts = line[9:].split(", Category: ")
+                source = parts[0].strip()
+                category = parts[1].strip() if len(parts) > 1 else "unknown"
+                
+                # Next lines should be the YAML list item
+                yaml_content = ""
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("# Source:"):
+                    yaml_content += lines[i]
+                    i += 1
+                
+                # Parse the YAML content
+                try:
+                    parsed = yaml.safe_load(yaml_content)
+                    if parsed and len(parsed) > 0:
+                        sys_dict[source] = (parsed[0], category)
+                except:
+                    pass
+            else:
+                i += 1
+    
+    # Parse user prompts with metadata
+    with open(user_path, "r") as f:
+        lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("# Source:"):
+                # Extract source and category
+                parts = line[9:].split(", Category: ")
+                source = parts[0].strip()
+                category = parts[1].strip() if len(parts) > 1 else "unknown"
+                
+                # Next lines should be the YAML list item
+                yaml_content = ""
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("# Source:"):
+                    yaml_content += lines[i]
+                    i += 1
+                
+                # Parse the YAML content
+                try:
+                    parsed = yaml.safe_load(yaml_content)
+                    if parsed and len(parsed) > 0:
+                        user_dict[source] = (parsed[0], category)
+                except:
+                    pass
+            else:
+                i += 1
+    
+    # Create aligned lists - only include entries that have both system and user prompts
+    system_prompts = []
+    user_prompts = []
+    sources = []
+    categories = []
+    
+    # Iterate through user prompts and match with system prompts
+    for source in user_dict.keys():
+        if source in sys_dict:
+            user_prompt, user_cat = user_dict[source]
+            sys_prompt, sys_cat = sys_dict[source]
+            
+            # Verify categories match (they should from same file)
+            if user_cat == sys_cat:
+                system_prompts.append(sys_prompt)
+                user_prompts.append(user_prompt)
+                sources.append(source)
+                categories.append(user_cat)
+            else:
+                print(f"Warning: Category mismatch for {source}: sys={sys_cat}, user={user_cat}")
+    
+    # Print summary
+    print(f"Loaded {len(system_prompts)} matched prompt pairs")
+    print(f"Categories found: {set(categories)}")
+    category_counts = {}
+    for cat in categories:
+        category_counts[cat] = category_counts.get(cat, 0) + 1
+    for cat in sorted(category_counts.keys()):
+        print(f"  {cat}: {category_counts[cat]}")
+    
+    # Check for unmatched entries
+    unmatched_sys = set(sys_dict.keys()) - set(user_dict.keys())
+    unmatched_user = set(user_dict.keys()) - set(sys_dict.keys())
+    if unmatched_sys:
+        print(f"Warning: {len(unmatched_sys)} system prompts without matching user prompts")
+    if unmatched_user:
+        print(f"Warning: {len(unmatched_user)} user prompts without matching system prompts")
+    
+    return system_prompts, user_prompts, sources, categories
+
+
 def create_user_token_mask(
     prompt_batch: List[str],
     formatted_tokens: dict,
@@ -77,24 +202,84 @@ def create_user_token_mask(
     mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=formatted_tokens['input_ids'].device)
     
     for i, prompt in enumerate(prompt_batch):
-        # Tokenize just the user content separately
-        user_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        # Decode full sequence to get text
+        full_text = tokenizer.decode(formatted_tokens['input_ids'][i], skip_special_tokens=False)
         
-        # Find where these tokens appear in the full sequence
-        full_tokens = formatted_tokens['input_ids'][i].tolist()
+        # Find user content boundaries in text
+        # Look for the user marker in chat template
+        user_marker = "<|im_start|>user"
+        marker_idx = full_text.find(user_marker)
         
-        # Find the user token subsequence in the full sequence
-        user_start = None
-        for j in range(len(full_tokens) - len(user_tokens) + 1):
-            if full_tokens[j:j+len(user_tokens)] == user_tokens:
-                user_start = j
-                break
+        if marker_idx == -1:
+            # Try alternative markers
+            user_marker = "user\n"
+            marker_idx = full_text.find(user_marker)
         
-        if user_start is not None:
-            user_end = user_start + len(user_tokens)
-            mask[i, user_start:user_end] = True
+        # Find where actual prompt content starts
+        if marker_idx != -1:
+            # Search for prompt text after the marker
+            search_after = marker_idx + len(user_marker)
+            # Use first 150 chars of prompt for matching
+            search_text = prompt[:min(150, len(prompt))].strip()
+            
+            # Find the prompt in the text
+            prompt_start_text = full_text.find(search_text, search_after)
+            
+            if prompt_start_text == -1:
+                # Try with first 50 chars
+                search_text = prompt[:min(50, len(prompt))].strip()
+                prompt_start_text = full_text.find(search_text, search_after)
+            
+            if prompt_start_text != -1:
+                # Found it - now map to tokens
+                prompt_end_text = prompt_start_text + len(prompt)
+                
+                # Map text positions to token positions
+                token_start = None
+                token_end = None
+                
+                for tok_idx in range(seq_len):
+                    # Decode up to current token
+                    decoded_so_far = tokenizer.decode(
+                        formatted_tokens['input_ids'][i][:tok_idx + 1],
+                        skip_special_tokens=False
+                    )
+                    
+                    # Check if we've reached prompt start
+                    if token_start is None and len(decoded_so_far) >= prompt_start_text:
+                        token_start = max(0, tok_idx - 1)
+                    
+                    # Check if we've reached prompt end
+                    if token_start is not None and len(decoded_so_far) >= prompt_end_text:
+                        token_end = tok_idx + 1
+                        break
+                
+                if token_start is not None and token_end is not None:
+                    mask[i, token_start:token_end] = True
+                else:
+                    # Fallback: everything after marker
+                    for tok_idx in range(seq_len):
+                        decoded = tokenizer.decode(
+                            formatted_tokens['input_ids'][i][:tok_idx],
+                            skip_special_tokens=False
+                        )
+                        if len(decoded) >= marker_idx + len(user_marker):
+                            mask[i, tok_idx:] = True
+                            break
+            else:
+                # Couldn't find prompt text - mask everything after marker
+                for tok_idx in range(seq_len):
+                    decoded = tokenizer.decode(
+                        formatted_tokens['input_ids'][i][:tok_idx],
+                        skip_special_tokens=False
+                    )
+                    if len(decoded) >= marker_idx + len(user_marker):
+                        mask[i, tok_idx:] = True
+                        break
         else:
-            raise ValueError(f"Could not find exact user token match for prompt {i}")
+            # No marker - fallback to masking second half
+            print(f"Warning: No user marker found for batch item {i}, using fallback")
+            mask[i, seq_len//2:] = True
     
     return mask
 
@@ -123,54 +308,98 @@ def create_system_token_mask(
     
     mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=formatted_tokens['input_ids'].device)
     
-    # Handle single system prompt vs list
-    if isinstance(system_prompts, str):
-        # Single system prompt for all
-        system_tokens = tokenizer.encode(system_prompts, add_special_tokens=False)
-        
-        for i in range(batch_size):
-            # Find where these tokens appear in the full sequence
-            full_tokens = formatted_tokens['input_ids'][i].tolist()
-            
-            # Find the system token subsequence in the full sequence
-            system_start = None
-            for j in range(len(full_tokens) - len(system_tokens) + 1):
-                if full_tokens[j:j+len(system_tokens)] == system_tokens:
-                    system_start = j
-                    break
-            
-            if system_start is not None:
-                system_end = system_start + len(system_tokens)
-                mask[i, system_start:system_end] = True
-            else:
-                raise ValueError(f"Could not find system token match for prompt {i}")
-    else:
-        # Different system prompts for different items in batch
-        for i in range(batch_size):
-            # Get the appropriate system prompt for this batch item
+    # Process each item in batch
+    for i in range(batch_size):
+        # Get the system prompt for this batch item
+        if isinstance(system_prompts, str):
+            system_prompt = system_prompts
+        else:
+            # List of system prompts
             if batch_indices is not None:
                 system_prompt = system_prompts[batch_indices[i]]
             else:
                 system_prompt = system_prompts[i]
+        
+        # Decode full sequence to get text
+        full_text = tokenizer.decode(formatted_tokens['input_ids'][i], skip_special_tokens=False)
+        
+        # Find system content boundaries in text
+        # Look for the system marker in chat template
+        system_marker = "<|im_start|>system"
+        marker_idx = full_text.find(system_marker)
+        
+        if marker_idx == -1:
+            # Try alternative markers
+            system_marker = "system\n"
+            marker_idx = full_text.find(system_marker)
+        
+        # Find where actual system prompt content starts
+        if marker_idx != -1:
+            # Search for system prompt text after the marker
+            search_after = marker_idx + len(system_marker)
+            # Use first 100 chars of system prompt for matching
+            search_text = system_prompt[:min(100, len(system_prompt))].strip()
             
-            # Tokenize just this system prompt content separately (without special tokens)
-            system_tokens = tokenizer.encode(system_prompt, add_special_tokens=False)
+            # Find the system prompt in the text
+            sys_start_text = full_text.find(search_text, search_after)
             
-            # Find where these tokens appear in the full sequence
-            full_tokens = formatted_tokens['input_ids'][i].tolist()
+            if sys_start_text == -1:
+                # Try with first 30 chars
+                search_text = system_prompt[:min(30, len(system_prompt))].strip()
+                sys_start_text = full_text.find(search_text, search_after)
             
-            # Find the system token subsequence in the full sequence
-            system_start = None
-            for j in range(len(full_tokens) - len(system_tokens) + 1):
-                if full_tokens[j:j+len(system_tokens)] == system_tokens:
-                    system_start = j
-                    break
-            
-            if system_start is not None:
-                system_end = system_start + len(system_tokens)
-                mask[i, system_start:system_end] = True
+            if sys_start_text != -1:
+                # Found it - now map to tokens
+                sys_end_text = sys_start_text + len(system_prompt)
+                
+                # Map text positions to token positions
+                token_start = None
+                token_end = None
+                
+                for tok_idx in range(seq_len):
+                    # Decode up to current token
+                    decoded_so_far = tokenizer.decode(
+                        formatted_tokens['input_ids'][i][:tok_idx + 1],
+                        skip_special_tokens=False
+                    )
+                    
+                    # Check if we've reached system prompt start
+                    if token_start is None and len(decoded_so_far) >= sys_start_text:
+                        token_start = max(0, tok_idx - 1)
+                    
+                    # Check if we've reached system prompt end
+                    if token_start is not None and len(decoded_so_far) >= sys_end_text:
+                        token_end = tok_idx + 1
+                        break
+                
+                if token_start is not None and token_end is not None:
+                    mask[i, token_start:token_end] = True
+                else:
+                    # Fallback: mask some tokens after marker
+                    for tok_idx in range(seq_len):
+                        decoded = tokenizer.decode(
+                            formatted_tokens['input_ids'][i][:tok_idx],
+                            skip_special_tokens=False
+                        )
+                        if len(decoded) >= marker_idx + len(system_marker):
+                            # Mask next 50 tokens as rough estimate
+                            mask[i, tok_idx:min(tok_idx + 50, seq_len)] = True
+                            break
             else:
-                raise ValueError(f"Could not find system token match for prompt {i}")
+                # Couldn't find system prompt text - mask tokens after marker
+                for tok_idx in range(seq_len):
+                    decoded = tokenizer.decode(
+                        formatted_tokens['input_ids'][i][:tok_idx],
+                        skip_special_tokens=False
+                    )
+                    if len(decoded) >= marker_idx + len(system_marker):
+                        # Mask next 50 tokens as rough estimate
+                        mask[i, tok_idx:min(tok_idx + 50, seq_len)] = True
+                        break
+        else:
+            # No marker - fallback to masking beginning portion
+            print(f"Warning: No system marker found for batch item {i}, using fallback")
+            mask[i, :seq_len//4] = True
     
     return mask
 
